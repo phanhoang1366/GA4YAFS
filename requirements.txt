@@ -1,0 +1,2 @@
+matplotlib
+-e git+https://github.com/acsicuib/YAFS@YAFS3#egg=yafs ; python_version >= "3.9.7"
