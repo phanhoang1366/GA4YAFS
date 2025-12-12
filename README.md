@@ -17,3 +17,7 @@ If not, `envsetup.sh` is provided for convenience. It makes a virtual environmen
 ```bash
 python main.py
 ```
+
+## To-do
+
+- Implement GAs (NSGA-II, NSGA-III and rule-based heuristics if possible)
