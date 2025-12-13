@@ -68,6 +68,6 @@ You can then pass the generated `placement_json` to YAFS's `JSONPlacement` inste
 
 This project is licensed under the GPLv3 License - see the LICENSE file for details.
 
-I use YAFS (YAFS3 branch), which is licensed under the MIT License - see the (YAFS)[https://github.com/acsicuib/YAFS] repository for details.
+I use YAFS (YAFS3 branch), which is licensed under the MIT License - see the [YAFS](https://github.com/acsicuib/YAFS) repository for details.
 
-This project uses code based from GA4FogPlacement, which is licensed under the GPLv3 License - see the (GA4FogPlacement)[https://github.com/acsicuib/GA4FogPlacement] repository for details.
+This project uses code based from GA4FogPlacement, which is licensed under the GPLv3 License - see the [GA4FogPlacement](https://github.com/acsicuib/GA4FogPlacement) repository for details.
