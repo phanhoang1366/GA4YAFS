@@ -14,10 +14,60 @@ If not, `envsetup.sh` is provided for convenience. It makes a virtual environmen
 
 ## Running
 
+Default (uses scenarios/allocDefinition.json):
+
 ```bash
 python main.py
 ```
 
+Run with GA-generated placement (still deterministic unless you change seeds):
+
+```bash
+python main.py --use-ga
+```
+
+Useful flags:
+- `--stop-time` (default 20000)
+- `--iterations` (default 1)
+- `--sim-seed` (base seed added to iteration index)
+- GA tuning: `--ga-model-seed`, `--ga-population-seed`, `--ga-evolution-seed`, `--ga-population-size`, `--ga-generations`, `--ga-mutation-probability`
+
+Change seeds or GA parameters to introduce variability across runs; keep them fixed for reproducible traces.
+
 ## To-do
 
 - Implement GAs (NSGA-II, NSGA-III and rule-based heuristics if possible)
+
+### NSGA-II (fog-only) module
+- New files under src/: config.py, system_model.py, population.py, ga_core.py, nsgaii.py
+- Usage example to produce a placement JSON (to later plug into main):
+
+```python
+from src.config import Config
+from src.system_model import SystemModel
+from src.ga_core import GACore
+from src.nsgaii import NSGAII
+
+cfg = Config()
+sysm = SystemModel(cfg)
+sysm.load()
+core = GACore(sysm, cfg)
+algo = NSGAII(core)
+pareto = algo.evolve()
+
+# Take first solution and export placement-like JSON
+best_idx = next(iter(pareto.fronts[0])) if pareto.fronts[0] else 0
+chrom = pareto.population[best_idx]
+placement_json = core.chromosome_to_placement_json(chrom)
+print(placement_json)
+```
+
+You can then pass the generated `placement_json` to YAFS's `JSONPlacement` instead of loading from scenarios/allocDefinition.json.
+
+## License
+
+This project is licensed under the GPLv3 License - see the LICENSE file for details.
+
+I use YAFS (YAFS3 branch), which is licensed under the MIT License - see the (YAFS)[https://github.com/acsicuib/YAFS] repository for details.
+
+This project uses code based from GA4FogPlacement, which is licensed under the GPLv3 License - see the (GA4FogPlacement)[https://github.com/acsicuib/GA4FogPlacement] repository for details.
