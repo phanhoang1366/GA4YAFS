@@ -93,10 +93,81 @@ class GACore:
         return newc
 
     def crossover(self, a: List[int], b: List[int]) -> List[int]:
-        if len(a) <= 1 or len(b) <= 1:
-            return a[:] if self.rnd_evol.random() < 0.5 else b[:]
-        cut = self.rnd_evol.randint(1, len(a) - 1)
-        return a[:cut] + b[cut:]
+        """
+                Multi-point crossover closer to original GAcore:
+                - If service grouping available, perform group-aware crossover:
+                    choose a single cut per app-group (like original MIO2 per row) and
+                    alternate parent segments per group.
+                - Otherwise, choose multiple cut points across the whole chromosome
+                    and alternate segments from parent A and B.
+        """
+        la = len(a)
+        lb = len(b)
+        if la == 0 and lb == 0:
+            return []
+        if la != lb:
+            # Fallback: copy the shorter prefix from A then fill with B
+            m = min(la, lb)
+            child = (a[:m] if self.rnd_evol.random() < 0.5 else b[:m])
+            base = a if len(a) >= len(b) else b
+            child += base[m:]
+            return child
+        n = la
+        if n <= 2:
+            # Small chromosomes: uniform per-gene selection
+            return [a[i] if self.rnd_evol.random() < 0.5 else b[i] for i in range(n)]
+
+        # If we have service_modules, build contiguous app groups
+        groups = []
+        try:
+            mods = getattr(self.system, 'service_modules', [])
+            if mods and len(mods) == n:
+                current_app = mods[0]['app_id']
+                start_idx = 0
+                for i in range(1, n):
+                    if mods[i]['app_id'] != current_app:
+                        groups.append((start_idx, i))  # [start, end) slice
+                        start_idx = i
+                        current_app = mods[i]['app_id']
+                groups.append((start_idx, n))
+        except Exception:
+            groups = []
+
+        child: List[int] = []
+        if groups and len(groups) > 0:
+            # Group-aware crossover: choose one cut inside each group and alternate parents per group
+            take_from_a = self.rnd_evol.random() < 0.5
+            for (g_start, g_end) in groups:
+                g_len = g_end - g_start
+                if g_len <= 1:
+                    # Single gene group: pick per-gene
+                    gene = a[g_start] if take_from_a else b[g_start]
+                    child.append(gene)
+                else:
+                    # Choose a single cut point inside the group (like MIO2)
+                    cut = self.rnd_evol.randint(g_start + 1, g_end - 1)
+                    seg1 = (a[g_start:cut] if take_from_a else b[g_start:cut])
+                    seg2 = (b[cut:g_end] if take_from_a else a[cut:g_end])
+                    child.extend(seg1)
+                    child.extend(seg2)
+                # Alternate parent choice for next group
+                take_from_a = not take_from_a
+            return child
+        else:
+            # Fallback: whole-chromosome multi-cut alternating segments
+            max_cuts = 5 if n >= 10 else (3 if n >= 5 else 2)
+            num_cuts = self.rnd_evol.randint(2, max_cuts)
+            cut_indices = sorted(set(self.rnd_evol.sample(range(1, n), k=num_cuts)))
+            boundaries = [0] + cut_indices + [n]
+
+            take_from_a = self.rnd_evol.random() < 0.5
+            for i in range(len(boundaries) - 1):
+                start = boundaries[i]
+                end = boundaries[i + 1]
+                segment = (a[start:end] if take_from_a else b[start:end])
+                child.extend(segment)
+                take_from_a = not take_from_a
+            return child
 
     def calculate_population_fitness_objectives(self, pop: Population):
         """
