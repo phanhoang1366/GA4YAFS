@@ -62,7 +62,26 @@ placement_json = core.chromosome_to_placement_json(chrom)
 print(placement_json)
 ```
 
-You can then pass the generated `placement_json` to YAFS's `JSONPlacement` instead of loading from scenarios/allocDefinition.json.
+#### CLI Usage
+
+Generate GA placement with custom parameters:
+
+```bash
+# Basic usage
+python main.py --use-ga
+
+# With custom GA parameters
+python main.py --use-ga --ga-population-size 30 --ga-generations 50 --ga-mutation-probability 0.3
+
+# Control randomness via seeds (deterministic if seeds fixed, variable if different)
+python main.py --use-ga --ga-model-seed 42 --ga-population-seed 42 --ga-evolution-seed 42
+```
+
+You can then pass the generated placement JSON to YAFS's JSONPlacement instead of loading from scenarios/allocDefinition.json.
+
+#### Enhancements
+
+See [ENHANCEMENTS.md](ENHANCEMENTS.md) for detailed information about advanced features and alignment with the original research paper.
 
 ## License
 

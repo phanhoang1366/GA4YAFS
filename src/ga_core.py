@@ -1,5 +1,8 @@
 import random
+import math
 from typing import Dict, Any, List
+
+import numpy as np
 
 from .population import Population
 from .system_model import SystemModel
@@ -15,6 +18,11 @@ class GACore:
         self.population_size = cfg.population_size
 
         self.population_pt = Population(self.population_size)
+        
+        # Objective weights (equal by default; can be tuned)
+        self.latency_weight = 1.0 / 3.0
+        self.spread_weight = 1.0 / 3.0
+        self.resource_weight = 1.0 / 3.0
 
     # Chromosome representation: list of length service_number
     # Each position maps service(module) i -> chosen fog node index
@@ -33,10 +41,55 @@ class GACore:
         self.calculate_population_fitness_objectives(pop)
 
     def mutate(self, chrom: List[int]) -> List[int]:
+        """
+        Apply mutation with multiple operators for diverse exploration.
+        Operators:
+        1. randomAssignment: randomly reassign services to nodes
+        2. serviceShuffle: swap placements of two random services
+        3. neighborSwap: move a service to a neighbor node in the topology
+        """
+        mutation_type = self.rnd_evol.choice(['random', 'shuffle', 'neighbor'])
         newc = chrom[:]
-        for i in range(len(newc)):
-            if self.rnd_evol.random() < self.cfg.mutation_probability:
-                newc[i] = self.rnd_evol.randint(0, len(self.system.fog_nodes) - 1)
+        
+        if mutation_type == 'random':
+            # Random reassignment: reassign some services randomly
+            for i in range(len(newc)):
+                if self.rnd_evol.random() < self.cfg.mutation_probability:
+                    newc[i] = self.rnd_evol.randint(0, len(self.system.fog_nodes) - 1)
+        
+        elif mutation_type == 'shuffle':
+            # Service shuffle: swap placements of two random services
+            if len(newc) > 1:
+                for _ in range(max(1, int(self.cfg.mutation_probability * len(newc)))):
+                    i = self.rnd_evol.randint(0, len(newc) - 1)
+                    j = self.rnd_evol.randint(0, len(newc) - 1)
+                    newc[i], newc[j] = newc[j], newc[i]
+        
+        elif mutation_type == 'neighbor':
+            # Neighbor swap: move services to topologically nearby nodes
+            if self.system.G is None:
+                # Fallback to random mutation if topology graph not available
+                for i in range(len(newc)):
+                    if self.rnd_evol.random() < self.cfg.mutation_probability:
+                        newc[i] = self.rnd_evol.randint(0, len(self.system.fog_nodes) - 1)
+            else:
+                for i in range(len(newc)):
+                    if self.rnd_evol.random() < self.cfg.mutation_probability:
+                        current_node = newc[i]
+                        # Get neighbors in topology
+                        neighbors = list(self.system.G.neighbors(self.system.fog_nodes[current_node]))
+                        if neighbors:
+                            # Convert neighbor node ID to fog_node index
+                            neighbor_indices = [self.system.fog_nodes.index(n) for n in neighbors if n in self.system.fog_nodes]
+                            if neighbor_indices:
+                                newc[i] = self.rnd_evol.choice(neighbor_indices)
+                            else:
+                                # Fallback: random reassignment if no valid neighbor index
+                                newc[i] = self.rnd_evol.randint(0, len(self.system.fog_nodes) - 1)
+                        else:
+                            # Fallback: random reassignment if node has no neighbors
+                            newc[i] = self.rnd_evol.randint(0, len(self.system.fog_nodes) - 1)
+        
         return newc
 
     def crossover(self, a: List[int], b: List[int]) -> List[int]:
@@ -46,30 +99,147 @@ class GACore:
         return a[:cut] + b[cut:]
 
     def calculate_population_fitness_objectives(self, pop: Population):
-        # Two objectives (to minimize):
-        # 1) total latency: sum of shortest-path latencies from service placements pairwise
-        # 2) resource overload: sum of overload across fog nodes (assignments exceeding capacity)
+        """
+        Three objectives (all to minimize via NSGA-II):
+        1) Latency: network delay between service placements
+        2) Spread: coefficient of variation (lower = more balanced distribution)
+        3) Resource Underutilization: 1 - utilization (lower = higher utilization)
+        """
         for idx, chrom in enumerate(pop.population):
-            # Objective 1: latency among services (approximate: sum distances to first service)
-            if len(chrom) > 0:
-                first = chrom[0]
-                lat_sum = 0.0
-                for s in chrom[1:]:
-                    lat_sum += self.system.dev_distance_matrix[first][s]
-            else:
-                lat_sum = 0.0
+            latency = self._calculate_latency(chrom)
+            spread = self._calculate_spread(chrom)
+            utilization = self._calculate_resource_utilization(chrom)
+            underutilization = 1.0 - utilization  # Minimize underutilization = maximize utilization
+            
+            pop.fitness[idx] = {
+                "latency": latency,
+                "spread": spread,
+                "underutilization": underutilization,
+                "index": idx
+            }
+    
+    def _calculate_latency(self, chrom: List[int]) -> float:
+        """
+        Objective 1: Minimize network latency based on service dependency DAG.
+        For each service, sum distances to its dependent services.
+        """
+        if len(chrom) == 0 or len(self.system.service_matrix) == 0:
+            return 0.0
+        
+        total_latency = 0.0
+        num_dependencies = 0
+        
+        # For each service, check its dependencies in the service matrix
+        for src_service_idx in range(len(chrom)):
+            src_node_idx = chrom[src_service_idx]
+            for dst_service_idx in range(len(chrom)):
+                # If service src depends on service dst
+                if self.system.service_matrix[src_service_idx][dst_service_idx] == 1:
+                    dst_node_idx = chrom[dst_service_idx]
+                    total_latency += self.system.dev_distance_matrix[src_node_idx][dst_node_idx]
+                    num_dependencies += 1
+        
+        # Normalize by average path length
+        if num_dependencies > 0:
+            normalized_latency = total_latency / (num_dependencies * self.system.average_path_length)
+        else:
+            normalized_latency = 0.0
+        
+        return normalized_latency
+    
+    def _calculate_spread(self, chrom: List[int]) -> float:
+        """
+        Objective 2: Maximize even distribution of services across fog devices.
+        Measures balance using coefficient of variation of placement counts and
+        average distance variance between placed services (approximation of spread).
+        Lower spread = more balanced and geographically distributed placement.
+        """
+        if len(chrom) == 0:
+            return 0.0
+        
+        # Metric 1: Coefficient of variation of placement counts per fog node
+        placement_count = [0 for _ in self.system.fog_nodes]
+        for fog_idx in chrom:
+            placement_count[fog_idx] += 1
+        
+        non_zero_counts = [c for c in placement_count if c > 0]
+        if len(non_zero_counts) == 0:
+            return 1.0  # All services unplaced (worst case)
+        
+        mean_count = np.mean(non_zero_counts)
+        std_count = np.std(non_zero_counts)
+        count_variance = (std_count / mean_count) if mean_count > 0 else 0.0
+        
+        # Metric 2: Average pairwise distance between all placed services
+        # (approximates geographic spread; higher distance = more spread out = better)
+        distance_variance = 0.0
+        placed_nodes = [chrom[s_idx] for s_idx in range(len(chrom))]
+        if len(placed_nodes) > 1:
+            pairwise_distances = []
+            for i in range(len(placed_nodes)):
+                for j in range(i + 1, len(placed_nodes)):
+                    dist = self.system.dev_distance_matrix[placed_nodes[i]][placed_nodes[j]]
+                    pairwise_distances.append(dist)
+            
+            if pairwise_distances:
+                mean_dist = np.mean(pairwise_distances)
+                # Find max distance in the distance matrix
+                max_possible_dist = 0.0
+                for row in self.system.dev_distance_matrix:
+                    for val in row:
+                        if val > max_possible_dist:
+                            max_possible_dist = val
+                
+                # Normalize to [0, 1] where higher = more spread out
+                if max_possible_dist > 0:
+                    normalized_mean_dist = mean_dist / max_possible_dist
+                    distance_variance = 1.0 - normalized_mean_dist  # Invert: lower metric = better
+                else:
+                    distance_variance = 0.0
+        
+        # Combine metrics: balance (count variance) + compactness (distance variance)
+        # Both components favor even distribution: low count variance + high distance variance
+        spread_score = 0.6 * count_variance + 0.4 * distance_variance
+        return float(spread_score)
+    
+    def _calculate_resource_utilization(self, chrom: List[int]) -> float:
+        """
+        Objective 3: Maximize fog resource utilization (minimize unused resources).
+        Returns: fraction of fog resources actually used (0-1, higher is better).
+        """
+        used = [0 for _ in self.system.fog_nodes]
+        for s_idx, fog_idx in enumerate(chrom):
+            used[fog_idx] += self.system.service_resources[s_idx]
+        
+        total_used = sum(used)
+        total_available = sum(self.system.fog_resources)
+        
+        if total_available == 0:
+            return 0.0
+        
+        utilization = total_used / total_available
+        return utilization  # Higher is better
 
-            # Objective 2: overload
-            used = [0 for _ in self.system.fog_nodes]
-            for s_idx, fog_idx in enumerate(chrom):
-                used[fog_idx] += self.system.service_resources[s_idx]
-            overload = 0
-            for i, u in enumerate(used):
-                capacity = self.system.fog_resources[i]
-                if u > capacity:
-                    overload += (u - capacity)
-
-            pop.fitness[idx] = {"latency": lat_sum, "overload": float(overload), "index": idx}
+    def is_feasible(self, chrom: List[int]) -> bool:
+        """
+        Constraint validation: Check if placement respects fog node resource limits.
+        Returns True if placement is feasible (all nodes have sufficient resources).
+        """
+        if len(chrom) != len(self.system.service_resources):
+            return False
+        
+        used = [0 for _ in self.system.fog_nodes]
+        for s_idx, fog_idx in enumerate(chrom):
+            if fog_idx < 0 or fog_idx >= len(self.system.fog_nodes):
+                return False
+            used[fog_idx] += self.system.service_resources[s_idx]
+        
+        # Check each node's resource constraint
+        for node_idx, resources_used in enumerate(used):
+            if resources_used > self.system.fog_resources[node_idx]:
+                return False
+        
+        return True
 
     def chromosome_to_placement_json(self, chrom: List[int]) -> Dict[str, Any]:
         # Produce allocDefinition-like entries mapping actual modules to fog nodes

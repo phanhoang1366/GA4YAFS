@@ -19,8 +19,17 @@ class NSGAII:
         def dominates(a, b):
             fa = pop.fitness[a]
             fb = pop.fitness[b]
-            better_or_equal = (fa["latency"] <= fb["latency"]) and (fa["overload"] <= fb["overload"]) 
-            strictly_better = (fa["latency"] < fb["latency"]) or (fa["overload"] < fb["overload"]) 
+            # Three objectives: minimize latency, spread, and underutilization
+            better_or_equal = (
+                fa.get("latency", 0) <= fb.get("latency", 0) and
+                fa.get("spread", 0) <= fb.get("spread", 0) and
+                fa.get("underutilization", 0) <= fb.get("underutilization", 0)
+            )
+            strictly_better = (
+                fa.get("latency", 0) < fb.get("latency", 0) or
+                fa.get("spread", 0) < fb.get("spread", 0) or
+                fa.get("underutilization", 0) < fb.get("underutilization", 0)
+            )
             return better_or_equal and strictly_better
 
         for p in range(len(pop.population)):
@@ -52,17 +61,20 @@ class NSGAII:
             return
         front_fitness = [pop.fitness[i] for i in front]
 
-        for key in ("latency", "overload"):
-            sorted_idx = sorted(front, key=lambda k: pop.fitness[k][key])
-            pop.crowding_distances[sorted_idx[0]] = float("inf")
-            pop.crowding_distances[sorted_idx[-1]] = float("inf")
-            fmin = pop.fitness[sorted_idx[0]][key]
-            fmax = pop.fitness[sorted_idx[-1]][key]
-            denom = (fmax - fmin) if (fmax - fmin) != 0 else 1.0
-            for k in range(1, len(sorted_idx) - 1):
-                prev = pop.fitness[sorted_idx[k - 1]][key]
-                nxt = pop.fitness[sorted_idx[k + 1]][key]
-                pop.crowding_distances[sorted_idx[k]] += (nxt - prev) / denom
+        # Calculate crowding distance for all three objectives
+        for key in ("latency", "spread", "underutilization"):
+            sorted_idx = sorted(front, key=lambda k: pop.fitness[k].get(key, 0))
+            if len(sorted_idx) > 0:
+                pop.crowding_distances[sorted_idx[0]] = float("inf")
+                if len(sorted_idx) > 1:
+                    pop.crowding_distances[sorted_idx[-1]] = float("inf")
+                    fmin = pop.fitness[sorted_idx[0]].get(key, 0)
+                    fmax = pop.fitness[sorted_idx[-1]].get(key, 0)
+                    denom = (fmax - fmin) if (fmax - fmin) != 0 else 1.0
+                    for k in range(1, len(sorted_idx) - 1):
+                        prev = pop.fitness[sorted_idx[k - 1]].get(key, 0)
+                        nxt = pop.fitness[sorted_idx[k + 1]].get(key, 0)
+                        pop.crowding_distances[sorted_idx[k]] += (nxt - prev) / denom
 
     def _calculate_crowding(self, pop: Population):
         i = 0
