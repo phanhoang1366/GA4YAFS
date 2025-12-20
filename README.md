@@ -79,10 +79,6 @@ python main.py --use-ga --ga-model-seed 42 --ga-population-seed 42 --ga-evolutio
 
 You can then pass the generated placement JSON to YAFS's JSONPlacement instead of loading from scenarios/allocDefinition.json.
 
-#### Enhancements
-
-See [ENHANCEMENTS.md](ENHANCEMENTS.md) for detailed information about advanced features and alignment with the original research paper.
-
 ## License
 
 This project is licensed under the GPLv3 License - see the LICENSE file for details.

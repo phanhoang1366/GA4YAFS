@@ -140,6 +140,8 @@ class GACore:
         2) Spread: coefficient of variation (lower = more balanced distribution)
         3) Resource Underutilization: 1 - utilization (lower = higher utilization)
         """
+        best_weight = 0
+        best_idx = -1
         for idx, chrom in enumerate(pop.population):
             latency = self._calculate_latency(chrom)
             spread = self._calculate_spread(chrom)
@@ -152,6 +154,15 @@ class GACore:
                 "underutilization": underutilization,
                 "index": idx
             }
+
+            weight = (self.latency_weight * latency +
+                      self.spread_weight * spread +
+                      self.resource_weight * underutilization)
+            if weight > best_weight:
+                best_weight = weight
+                best_idx = idx
+
+        print(f"{pop.fitness[best_idx]['latency']},{pop.fitness[best_idx]['spread']},{pop.fitness[best_idx]['underutilization']}")
     
     def _calculate_latency(self, chrom: List[List[int]]) -> float:
         """
@@ -249,13 +260,30 @@ class GACore:
         """
         placement_row = chrom[0]
         replica_row = chrom[1]
-        
-        # Account for primary placement only (replicas placed via strategy, not counted in fitness)
-        # This simplification avoids double-counting and complex replica placement in fitness
+
+        # Conservative but placement-aware accounting:
+        # count primary instance on its node, and allocate each additional replica
+        # to the nodes selected by `_get_replica_nodes()` so utilization depends
+        # on how replicas are distributed.
         used = [0 for _ in self.system.fog_nodes]
-        for s_idx, fog_idx in enumerate(placement_row):
-            # Only count primary placement for utilization metric
-            used[fog_idx] += self.system.service_resources[s_idx]
+        # Cache replica selections per service to avoid repeated path computations
+        replica_selection_cache = {}
+        for s_idx, primary_idx in enumerate(placement_row):
+            res = self.system.service_resources[s_idx]
+            # primary
+            if 0 <= primary_idx < len(used):
+                used[primary_idx] += res
+            # replicas
+            n_reps = max(0, replica_row[s_idx] - 1)
+            if n_reps > 0:
+                if s_idx in replica_selection_cache:
+                    rep_nodes = replica_selection_cache[s_idx]
+                else:
+                    rep_nodes = self._get_replica_nodes(primary_idx, n_reps, s_idx)
+                    replica_selection_cache[s_idx] = rep_nodes
+                for rn in rep_nodes:
+                    if 0 <= rn < len(used):
+                        used[rn] += res
         
         total_used = sum(used)
         total_available = sum(self.system.fog_resources)
@@ -368,8 +396,6 @@ class GACore:
             # Simple capacity check (optimistic: assume node has space)
             if self.system.fog_resources[cand_idx] >= service_resource:
                 replica_nodes.append(cand_idx)
-        
-        # If not enough valid candidates, fill with remaining nodes (best-effort)
         while len(replica_nodes) < num_replicas and len(candidates) > len(replica_nodes):
             for cand_idx in candidates:
                 if cand_idx not in replica_nodes:

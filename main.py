@@ -99,7 +99,7 @@ def main(stop_time, it, folder_results, placement_override=None):
     """
     logging.info(" Performing simulation: %i " % it)
     s.run(stop_time)  # To test deployments put test_initial_deploy a TRUE
-    s.print_debug_assignaments()
+    # s.print_debug_assignaments()
 
     # Analysing the results. 
     dfl = pd.read_csv(folder_results+"sim_trace"+"_link.csv")

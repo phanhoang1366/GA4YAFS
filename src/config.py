@@ -7,7 +7,7 @@ class Config:
     population_size: int = 50
     mutation_probability: float = 0.2
     number_generations: int = 20
-    max_replicas: int = 10  # Maximum replicas per service (1 = no replicas, 2 = 1 additional, etc.)
+    max_replicas: int = 5  # Maximum replicas per service (1 = no replicas, 2 = 1 additional, etc.)
 
     # Seeds
     model_seed: int = 50
