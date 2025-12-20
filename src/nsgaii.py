@@ -128,7 +128,7 @@ class NSGAII:
         self.fast_non_dominated_sort(self.core.population_pt)
         self._calculate_crowding(self.core.population_pt)
 
-        for _ in range(self.core.cfg.number_generations):
+        for gen in range(self.core.cfg.number_generations):
             pre = datetime.now()
             offspring = self._evolve_to_offspring()
 
@@ -143,6 +143,24 @@ class NSGAII:
             for i in range(self.core.population_size):
                 final.population.append(merged.population[ordered[i]["index"]])
             self.core.calculate_population_fitness_objectives(final)
+
+            # Print best combined-weight solution for this generation (once)
+            best_weight = -float('inf')
+            best_idx = -1
+            for idx in range(len(final.population)):
+                f = final.fitness[idx]
+                weight = (self.core.latency_weight * f.get('latency', 0) +
+                          self.core.spread_weight * f.get('spread', 0) +
+                          self.core.resource_weight * f.get('underutilization', 0))
+                if weight > best_weight:
+                    best_weight = weight
+                    best_idx = idx
+            if best_idx >= 0:
+                bf = final.fitness[best_idx]
+                # print(f"Gen {gen+1}: Latency={bf['latency']:.4f}, Spread={bf['spread']:.4f}, Underutilization={bf['underutilization']:.4f}")
+                # CSV friendly output
+                print(f"{bf['latency']},{bf['spread']},{bf['underutilization']}")
+
 
             self.core.population_pt = final
             self.fast_non_dominated_sort(self.core.population_pt)

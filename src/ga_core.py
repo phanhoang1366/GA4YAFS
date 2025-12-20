@@ -1,6 +1,7 @@
 import random
 import math
-from typing import Dict, Any, List
+import hashlib
+from typing import Dict, Any, List, Optional
 
 import numpy as np
 
@@ -23,6 +24,15 @@ class GACore:
         self.latency_weight = 1.0 / 3.0
         self.spread_weight = 1.0 / 3.0
         self.resource_weight = 1.0 / 3.0
+
+    def _chrom_seed(self, placement_row: List[int], replica_row: List[int], extra: str = "") -> int:
+        """Deterministic seed for a chromosome + optional extra string."""
+        s1 = ",".join(str(x) for x in placement_row)
+        s2 = ",".join(str(x) for x in replica_row)
+        blob = (s1 + "|" + s2 + "|" + extra).encode("utf-8")
+        h = hashlib.sha256(blob).digest()
+        # use first 8 bytes to form an int seed
+        return int.from_bytes(h[:8], "big")
 
     # Chromosome representation: 2D array with 2 rows
     # Row 0: Primary node placement for each service (fog node index)
@@ -140,8 +150,6 @@ class GACore:
         2) Spread: coefficient of variation (lower = more balanced distribution)
         3) Resource Underutilization: 1 - utilization (lower = higher utilization)
         """
-        best_weight = 0
-        best_idx = -1
         for idx, chrom in enumerate(pop.population):
             latency = self._calculate_latency(chrom)
             spread = self._calculate_spread(chrom)
@@ -154,16 +162,7 @@ class GACore:
                 "underutilization": underutilization,
                 "index": idx
             }
-
-            weight = (self.latency_weight * latency +
-                      self.spread_weight * spread +
-                      self.resource_weight * underutilization)
-            if weight > best_weight:
-                best_weight = weight
-                best_idx = idx
-
-        print(f"{pop.fitness[best_idx]['latency']},{pop.fitness[best_idx]['spread']},{pop.fitness[best_idx]['underutilization']}")
-    
+            
     def _calculate_latency(self, chrom: List[List[int]]) -> float:
         """
         Objective 1: Minimize network latency based on service dependency DAG.
@@ -268,6 +267,9 @@ class GACore:
         used = [0 for _ in self.system.fog_nodes]
         # Cache replica selections per service to avoid repeated path computations
         replica_selection_cache = {}
+        # Deterministic per-chromosome RNG to make random replica placement repeatable
+        seed = self._chrom_seed(placement_row, replica_row)
+        chrom_rng = random.Random(seed)
         for s_idx, primary_idx in enumerate(placement_row):
             res = self.system.service_resources[s_idx]
             # primary
@@ -279,7 +281,7 @@ class GACore:
                 if s_idx in replica_selection_cache:
                     rep_nodes = replica_selection_cache[s_idx]
                 else:
-                    rep_nodes = self._get_replica_nodes(primary_idx, n_reps, s_idx)
+                    rep_nodes = self._get_replica_nodes(primary_idx, n_reps, s_idx, rng=chrom_rng)
                     replica_selection_cache[s_idx] = rep_nodes
                 for rn in rep_nodes:
                     if 0 <= rn < len(used):
@@ -333,6 +335,10 @@ class GACore:
         replica_row = chrom[1]
         placement = []
         
+        # Use deterministic RNG per-chromosome so exported replica placement is stable
+        seed = self._chrom_seed(placement_row, replica_row)
+        chrom_rng = random.Random(seed)
+
         for s_idx in range(len(placement_row)):
             primary_fog_idx = placement_row[s_idx]
             num_replicas = replica_row[s_idx]
@@ -347,7 +353,7 @@ class GACore:
             
             # Place additional replicas using nearest-neighbor strategy
             if num_replicas > 1:
-                replica_nodes = self._get_replica_nodes(primary_fog_idx, num_replicas - 1, s_idx)
+                replica_nodes = self._get_replica_nodes(primary_fog_idx, num_replicas - 1, s_idx, rng=chrom_rng)
                 for rep_fog_idx in replica_nodes:
                     placement.append({
                         "module_name": mod["module_name"],
@@ -357,7 +363,8 @@ class GACore:
         
         return {"initialAllocation": placement}
     
-    def _get_replica_nodes(self, primary_node_idx: int, num_replicas: int, service_idx: int) -> List[int]:
+    def _get_replica_nodes(self, primary_node_idx: int, num_replicas: int, service_idx: int,
+                           rng: Optional[random.Random] = None) -> List[int]:
         """
         Select nodes for replicas using nearest-neighbor strategy.
         Prioritizes topologically close nodes with available resources.
