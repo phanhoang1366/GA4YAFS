@@ -48,7 +48,9 @@ class SystemModel:
             res = n.get("RAM", n.get("capacity", 10))
             # IPT is the documented processing rate; fall back to speed
             speed = n.get("IPT", n.get("speed", 100))
-            G.add_node(node_id, nodetype="fog", capacity=res, speed=speed)
+            # Preserve declared node type (e.g., CLOUD) if present; default to 'fog'
+            node_type = n.get("type") or n.get("nodetype") or "fog"
+            G.add_node(node_id, nodetype=node_type, capacity=res, speed=speed)
 
         for l in links:
             src = l.get("s", l.get("source"))
@@ -58,7 +60,8 @@ class SystemModel:
             G.add_edge(src, dst, weight=lat, bandwidth=bw, latency=lat)
 
         self.G = G
-        self.fog_nodes = list(G.nodes())
+        # Exclude cloud nodes from fog node lists (nodes with nodetype == 'CLOUD')
+        self.fog_nodes = [n for n in G.nodes() if G.nodes[n].get("nodetype") != "CLOUD"]
         self.fog_resources = [G.nodes[i].get("capacity", 10) for i in self.fog_nodes]
         self.fog_speed_cpu = [G.nodes[i].get("speed", 100) for i in self.fog_nodes]
 
@@ -69,7 +72,8 @@ class SystemModel:
         for u in self.fog_nodes:
             dist = nx.single_source_dijkstra_path_length(G, u, weight="latency")
             for v, d in dist.items():
-                self.dev_distance_matrix[index_of[u]][index_of[v]] = float(d)
+                if v in index_of:
+                    self.dev_distance_matrix[index_of[u]][index_of[v]] = float(d)
         
         # Average path length for normalization
         all_distances = [d for row in self.dev_distance_matrix for d in row if d > 0]
