@@ -154,6 +154,7 @@ if __name__ == '__main__':
     parser.add_argument("--ga-population-size", type=int, default=50, help="GA population size")
     parser.add_argument("--ga-generations", type=int, default=20, help="GA number of generations")
     parser.add_argument("--ga-mutation-probability", type=float, default=0.2, help="GA mutation probability")
+    parser.add_argument("--auto-adjust-weights", action="store_true", help="Enable automatic scaling of objective magnitudes for GA weighted total")
     args = parser.parse_args()
 
     LOGGING_CONFIG = Path(__file__).parent / 'logging.ini'
@@ -170,6 +171,7 @@ if __name__ == '__main__':
         model_seed=args.ga_model_seed,
         population_seed=args.ga_population_seed,
         evolution_seed=args.ga_evolution_seed,
+        auto_adjust_weights=args.auto_adjust_weights,
     )
 
     placement_override = generate_ga_placement(cfg) if args.use_ga else None

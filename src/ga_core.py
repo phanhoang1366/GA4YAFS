@@ -24,6 +24,11 @@ class GACore:
         self.latency_weight = 1.0 / 3.0
         self.spread_weight = 1.0 / 3.0
         self.resource_weight = 1.0 / 3.0
+        # Auto-adjust flag: when True, scale spread magnitudes to be comparable
+        # with latency based on population observations before computing a
+        # weighted `total` score. Does not change individual objectives used
+        # by NSGA-II, but provides a `total` for convenience/legacy code.
+        self.auto_adjust_weights = getattr(cfg, "auto_adjust_weights", False)
 
     def _chrom_seed(self, placement_row: List[int], replica_row: List[int], extra: str = "") -> int:
         """Deterministic seed for a chromosome + optional extra string."""
@@ -150,44 +155,113 @@ class GACore:
         2) Spread: coefficient of variation (lower = more balanced distribution)
         3) Resource Underutilization: 1 - utilization (lower = higher utilization)
         """
+        latencies = []
+        spreads = []
+        unders = []
+
         for idx, chrom in enumerate(pop.population):
             latency = self._calculate_latency(chrom)
             spread = self._calculate_spread(chrom)
             utilization = self._calculate_resource_utilization(chrom)
             underutilization = 1.0 - utilization  # Minimize underutilization = maximize utilization
-            
+
             pop.fitness[idx] = {
                 "latency": latency,
                 "spread": spread,
                 "underutilization": underutilization,
                 "index": idx
             }
+
+            latencies.append(latency)
+            spreads.append(spread)
+            unders.append(underutilization)
+
+        # Compute automatic scaling factor for spread -> latency magnitude
+        beta = 1.0
+        if self.auto_adjust_weights and len(spreads) > 0:
+            spread_max = max(spreads)
+            latency_min = min(latencies) if len(latencies) > 0 else 0.0
+            if spread_max > 0:
+                beta = (latency_min / spread_max) if latency_min > 0 else 1.0
+            else:
+                beta = 1.0
+
+        # Attach a convenience `total` score and scaled components so legacy
+        # code or callers that expect a single scalar can use it. `total`
+        # respects the configured objective weights but uses an automatically
+        # scaled spread when `auto_adjust_weights` is enabled.
+        for idx in range(len(pop.population)):
+            f = pop.fitness[idx]
+            norm_spread = f["spread"] * beta
+            total = (
+                self.latency_weight * f["latency"]
+                + self.spread_weight * norm_spread
+                + self.resource_weight * f["underutilization"]
+            )
+            f["total"] = total
+            f["wlat"] = f["latency"]
+            f["wsp"] = norm_spread
+            f["wres"] = f["underutilization"]
+            pop.fitness[idx] = f
             
     def _calculate_latency(self, chrom: List[List[int]]) -> float:
         """
         Objective 1: Minimize network latency based on service dependency DAG.
-        For 2-row chromosome, use primary placement (row 0) for distance calculations.
+        Accounts for replicas: for each service interaction, finds the minimum
+        distance to any replica of the dependency (mimics original GA4YAFS).
         """
         placement_row = chrom[0]
+        replica_row = chrom[1]
+        
         if len(placement_row) == 0 or len(self.system.service_matrix) == 0:
             return 0.0
         
-        total_latency = 0.0
-        num_dependencies = 0
+        # Get replica placements for all services (cached for efficiency)
+        service_replica_nodes = {}
+        for s_idx in range(len(placement_row)):
+            primary_node = placement_row[s_idx]
+            num_replicas = replica_row[s_idx]
+            
+            replica_nodes = [primary_node]
+            if num_replicas > 1:
+                seed = self._chrom_seed(placement_row, replica_row, extra=f"srv{s_idx}")
+                srv_rng = random.Random(seed)
+                additional_replicas = self._get_replica_nodes(primary_node, num_replicas - 1, s_idx, rng=srv_rng)
+                replica_nodes.extend(additional_replicas)
+            
+            service_replica_nodes[s_idx] = replica_nodes
         
-        # For each service, check its dependencies in the service matrix
-        for src_service_idx in range(len(placement_row)):
-            src_node_idx = placement_row[src_service_idx]
-            for dst_service_idx in range(len(placement_row)):
-                # If service src depends on service dst
-                if self.system.service_matrix[src_service_idx][dst_service_idx] == 1:
-                    dst_node_idx = placement_row[dst_service_idx]
-                    total_latency += self.system.dev_distance_matrix[src_node_idx][dst_node_idx]
-                    num_dependencies += 1
+        total_distance = 0.0
+        num_interactions = 0
         
-        # Normalize by average path length
-        if num_dependencies > 0:
-            normalized_latency = total_latency / (num_dependencies * self.system.average_path_length)
+        # For each service that has dependencies
+        for src_service in range(len(placement_row)):
+            consumed_services = []
+            for dst_service in range(len(self.system.service_matrix[src_service])):
+                if self.system.service_matrix[src_service][dst_service] == 1:
+                    consumed_services.append(dst_service)
+            
+            if len(consumed_services) > 0:
+                src_nodes = service_replica_nodes[src_service]
+                
+                # For each consumed service, find minimum distance from any src replica to any dst replica
+                for dst_service in consumed_services:
+                    dst_nodes = service_replica_nodes[dst_service]
+                    
+                    # For each instance of the source service, find nearest instance of dependency
+                    for src_node in src_nodes:
+                        min_dist = float('inf')
+                        for dst_node in dst_nodes:
+                            dist = self.system.dev_distance_matrix[src_node][dst_node]
+                            min_dist = min(min_dist, dist)
+                        total_distance += min_dist
+                        num_interactions += 1
+        
+        # Calculate average distance per interaction
+        if num_interactions > 0:
+            avg_distance = total_distance / num_interactions
+            # Normalize by average path length
+            normalized_latency = avg_distance / self.system.average_path_length
         else:
             normalized_latency = 0.0
         
@@ -195,61 +269,93 @@ class GACore:
     
     def _calculate_spread(self, chrom: List[List[int]]) -> float:
         """
-        Objective 2: Maximize even distribution of services across fog devices.
-        For 2-row chromosome, considers both placement and replica counts.
-        Lower spread = more balanced and geographically distributed placement.
+        Objective 2: Spread metric with two modes:
+        - If replicas are disabled (`max_replicas == 1`): use global balance
+          + compactness across all services (counts + placement distances).
+        - Otherwise: per-service replica CV (original GA4YAFS semantics).
+        Lower is better in both cases.
         """
         placement_row = chrom[0]
         replica_row = chrom[1]
         
         if len(placement_row) == 0:
             return 0.0
-        
-        # Metric 1: Coefficient of variation of placement counts per fog node
-        # Account for replicas: each service contributes replica_count instances
-        placement_count = [0 for _ in self.system.fog_nodes]
-        for s_idx, fog_idx in enumerate(placement_row):
-            placement_count[fog_idx] += replica_row[s_idx]
-        
-        non_zero_counts = [c for c in placement_count if c > 0]
-        if len(non_zero_counts) == 0:
-            return 1.0  # All services unplaced (worst case)
-        
-        mean_count = np.mean(non_zero_counts)
-        std_count = np.std(non_zero_counts)
-        count_variance = (std_count / mean_count) if mean_count > 0 else 0.0
-        
-        # Metric 2: Average pairwise distance between all placed services
-        # (approximates geographic spread; higher distance = more spread out = better)
-        distance_variance = 0.0
-        placed_nodes = [placement_row[s_idx] for s_idx in range(len(placement_row))]
-        if len(placed_nodes) > 1:
-            pairwise_distances = []
-            for i in range(len(placed_nodes)):
-                for j in range(i + 1, len(placed_nodes)):
-                    dist = self.system.dev_distance_matrix[placed_nodes[i]][placed_nodes[j]]
-                    pairwise_distances.append(dist)
-            
-            if pairwise_distances:
-                mean_dist = np.mean(pairwise_distances)
-                # Find max distance in the distance matrix
-                max_possible_dist = 0.0
-                for row in self.system.dev_distance_matrix:
-                    for val in row:
-                        if val > max_possible_dist:
-                            max_possible_dist = val
-                
-                # Normalize to [0, 1] where higher = more spread out
-                if max_possible_dist > 0:
-                    normalized_mean_dist = mean_dist / max_possible_dist
-                    distance_variance = 1.0 - normalized_mean_dist  # Invert: lower metric = better
+
+        # Mode 1: replicas disabled → global spread
+        if self.cfg.max_replicas == 1:
+            # Coefficient of variation of service counts per fog node
+            placement_count = [0 for _ in self.system.fog_nodes]
+            for fog_idx in placement_row:
+                placement_count[fog_idx] += 1
+
+            non_zero_counts = [c for c in placement_count if c > 0]
+            if len(non_zero_counts) == 0:
+                return 1.0
+
+            mean_count = np.mean(non_zero_counts)
+            std_count = np.std(non_zero_counts)
+            count_variance = (std_count / mean_count) if mean_count > 0 else 0.0
+
+            # Compactness: average pairwise distance between placed services
+            compactness_score = 0.0
+            placed_nodes = placement_row[:]  # one entry per service
+            if len(placed_nodes) > 1:
+                pairwise_distances = []
+                for i in range(len(placed_nodes)):
+                    for j in range(i + 1, len(placed_nodes)):
+                        dist = self.system.dev_distance_matrix[placed_nodes[i]][placed_nodes[j]]
+                        pairwise_distances.append(dist)
+
+                if pairwise_distances:
+                    mean_dist = np.mean(pairwise_distances)
+                    max_possible_dist = 0.0
+                    for row in self.system.dev_distance_matrix:
+                        for val in row:
+                            if val > max_possible_dist:
+                                max_possible_dist = val
+
+                    if max_possible_dist > 0:
+                        normalized_mean_dist = mean_dist / max_possible_dist
+                        compactness_score = 1.0 - normalized_mean_dist  # more spread → lower compactness
+                    else:
+                        compactness_score = 0.0
+
+            # Balance both components (lower is better)
+            return float(0.5 * count_variance + 0.5 * compactness_score)
+
+        # Mode 2: replicas enabled → per-service replica CV
+        total_spread = 0.0
+
+        for s_idx in range(len(placement_row)):
+            primary_node = placement_row[s_idx]
+            num_replicas = replica_row[s_idx]
+
+            replica_nodes = [primary_node]
+            if num_replicas > 1:
+                seed = self._chrom_seed(placement_row, replica_row, extra=f"srv{s_idx}")
+                srv_rng = random.Random(seed)
+                additional_replicas = self._get_replica_nodes(primary_node, num_replicas - 1, s_idx, rng=srv_rng)
+                replica_nodes.extend(additional_replicas)
+
+            if len(replica_nodes) > 1:
+                pairwise_distances = []
+                for i in range(len(replica_nodes)):
+                    for j in range(i + 1, len(replica_nodes)):
+                        dist = self.system.dev_distance_matrix[replica_nodes[i]][replica_nodes[j]]
+                        pairwise_distances.append(dist)
+
+                if pairwise_distances and np.mean(pairwise_distances) > 0:
+                    mean_dist = np.mean(pairwise_distances)
+                    std_dist = np.std(pairwise_distances)
+                    service_spread = std_dist / mean_dist
                 else:
-                    distance_variance = 0.0
-        
-        # Combine metrics: balance (count variance) + compactness (distance variance)
-        # Both components favor even distribution: low count variance + high distance variance
-        spread_score = 0.6 * count_variance + 0.4 * distance_variance
-        return float(spread_score)
+                    service_spread = 0.0
+            else:
+                service_spread = 1.0
+
+            total_spread += service_spread
+
+        return float(total_spread / len(placement_row))
     
     def _calculate_resource_utilization(self, chrom: List[List[int]]) -> float:
         """
@@ -376,9 +482,28 @@ class GACore:
         candidates = list(range(len(self.system.fog_nodes)))
         candidates.remove(primary_node_idx)  # Exclude primary node
         
-        # Sort candidates by distance from primary node
+        # Service resource needed for capacity checks
+        service_resource = self.system.service_resources[service_idx]
+
+        # If an RNG is provided, use it to randomly choose feasible nodes.
+        # This makes replica placement stochastic/deterministic based on the RNG.
+        if rng is not None:
+            feasible = [c for c in candidates if self.system.fog_resources[c] >= service_resource]
+            if len(feasible) >= num_replicas:
+                return rng.sample(feasible, num_replicas)
+            # Not enough feasible nodes: take all feasible, then randomly fill from remaining
+            selected = feasible[:]
+            remaining = [c for c in candidates if c not in selected]
+            rng.shuffle(remaining)
+            for c in remaining:
+                if len(selected) >= num_replicas:
+                    break
+                selected.append(c)
+            return selected[:num_replicas]
+
+        # Default behavior: nearest-neighbor (topology-aware) selection
+        # Sort candidates by distance from primary node if topology available
         if self.system.G is not None:
-            # Use topology distance if available
             try:
                 import networkx as nx
                 primary_id = self.system.fog_nodes[primary_node_idx]
@@ -394,20 +519,19 @@ class GACore:
                 candidates = [idx for _, idx in distances]
             except:
                 pass  # Fallback to unsorted candidates
-        
+
         # Select nearest neighbors with resource checks
-        service_resource = self.system.service_resources[service_idx]
         for cand_idx in candidates:
             if len(replica_nodes) >= num_replicas:
                 break
-            # Simple capacity check (optimistic: assume node has space)
             if self.system.fog_resources[cand_idx] >= service_resource:
                 replica_nodes.append(cand_idx)
-        while len(replica_nodes) < num_replicas and len(candidates) > len(replica_nodes):
-            for cand_idx in candidates:
-                if cand_idx not in replica_nodes:
-                    replica_nodes.append(cand_idx)
-                    if len(replica_nodes) >= num_replicas:
-                        break
-        
+
+        # If still not enough, fill from remaining candidates in order
+        for cand_idx in candidates:
+            if len(replica_nodes) >= num_replicas:
+                break
+            if cand_idx not in replica_nodes:
+                replica_nodes.append(cand_idx)
+
         return replica_nodes[:num_replicas]
